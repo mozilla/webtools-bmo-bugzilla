@@ -13,6 +13,7 @@ use warnings;
 
 use base qw(Bugzilla::WebService);
 
+use Bugzilla::Logging;
 use Bugzilla::Comment;
 use Bugzilla::Comment::TagWeights;
 use Bugzilla::Constants;
@@ -32,12 +33,17 @@ use Bugzilla::Search;
 use Bugzilla::Product;
 use Bugzilla::FlagType;
 use Bugzilla::Search::Quicksearch;
+use Bugzilla::Report::Graph;
 
 use List::Util qw(max);
 use List::MoreUtils qw(uniq);
 use Storable qw(dclone);
 use Types::Standard -all;
 use Type::Utils;
+use PerlX::Maybe;
+use Graph::D3;
+use Try::Tiny;
+use Set::Object qw(set);
 
 #############
 # Constants #
@@ -73,6 +79,7 @@ use constant READ_ONLY => qw(
   comments
   fields
   get
+  graph
   history
   legal_values
   search
@@ -86,6 +93,7 @@ use constant PUBLIC_METHODS => qw(
   create
   fields
   get
+  graph
   history
   legal_values
   possible_duplicates
@@ -470,6 +478,103 @@ sub get {
   }
   return {bugs => \@hashes, faults => \@faults};
 }
+
+my $GRAPH_RELATIONSHIP = qr{
+  ^
+  (?: (?: (?<table>dependencies): (?<fields>
+                                  dependson,blocked
+                                | blocked,dependson) )
+      | (?: (?<table>duplicates): (?<fields>
+                                dupe,dupe_of
+                              | dupe_of,dupe) )
+    )
+  $
+}xs;
+
+my $GRAPH_TYPE = qr{
+    ^
+    (?: text
+      | json_tree
+      | bug_tree
+      | hierarchical_edge_bundling
+      | force_directed_graph
+    )
+    $
+}xs;
+
+sub graph {
+  my ($self, $params) = @_;
+  my $bug_id       = $params->{id};
+  my $type         = $params->{type};
+  my $relationship = $params->{relationship};
+  my $depth        = $params->{depth};
+
+  ThrowCodeError('param_invalid', {function => 'Bug.graph', param => 'bug_id'})
+    unless $bug_id =~ /^\d+$/;
+
+  if (defined $depth) {
+    ThrowCodeError('param_invalid', {function => 'Bug.graph', param => 'depth'})
+      unless $depth =~ /^\d+$/;
+
+    ThrowCodeError('param_invalid', {function => 'Bug.graph', param => 'depth'})
+      unless $depth > 1 && $depth < 9;
+  }
+
+  ThrowCodeError('param_invalid', {function => 'Bug.graph', param => 'type'})
+    unless $type =~ $GRAPH_TYPE;
+
+  my ($table, $source, $sink);
+  if ($relationship) {
+    ThrowCodeError('param_invalid',
+      {function => 'Bug.graph', param => 'relationship'})
+      unless $relationship =~ $GRAPH_RELATIONSHIP;
+    ($table, $source, $sink) = ($+{table}, split(/,/, $+{fields} // ''));
+  }
+
+  my $result;
+  try {
+    Bugzilla->switch_to_shadow_db();
+    my $report = Bugzilla::Report::Graph->new(
+      dbh          => Bugzilla->dbh,
+      bug_id       => $bug_id,
+      maybe table  => $table,
+      maybe source => $source,
+      maybe sink   => $sink,
+      maybe depth  => $depth,
+    );
+
+    my $user = Bugzilla->user;
+    $report->prune_graph(sub { $user->visible_bugs($_[0]) });
+
+    if ($type eq 'text') {
+      $result = {text => $report->graph . ""};
+    }
+    elsif ($type eq 'json_tree') {
+      $result = {tree => $report->tree}
+    }
+    elsif ($type eq 'bug_tree') {
+      my $bugs = Bugzilla::Bug->new_from_list([$report->graph->vertices]);
+      foreach my $bug (@$bugs) {
+        $report->graph->set_vertex_attributes($bug->id, $self->_bug_to_hash($bug, $params));
+      }
+      $result = {tree => $report->tree}
+    }
+    elsif ($type eq 'force_directed_graph' || $type eq 'hierarchical_edge_bundling')
+    {
+      $result = Graph::D3->new(graph => $report->graph)->$type;
+    }
+  }
+  catch {
+    FATAL($_);
+    $result = {
+      exception => "Internal Error",
+      request_id => $Bugzilla::App::CGI::C->req->request_id
+    };
+  };
+
+  return $result;
+}
+
 
 # this is a function that gets bug activity for list of bug ids
 # it can be called as the following:
